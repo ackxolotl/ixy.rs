@@ -174,7 +174,7 @@ impl IxyDevice for IxgbeVFDevice {
             last_rx_index = queue.rx_index;
 
             for i in 0..num_packets {
-                let desc = unsafe { queue.descriptors.add(rx_index) as *mut ixgbe_adv_rx_desc };
+                let desc = unsafe { queue.descriptors.add(rx_index) };
                 let status =
                     unsafe { ptr::read_volatile(&mut (*desc).wb.upper.status_error as *mut u32) };
 
@@ -242,16 +242,16 @@ impl IxyDevice for IxgbeVFDevice {
         let mut sent = 0;
 
         {
-            let mut queue = self
+            let queue = self
                 .tx_queues
                 .get_mut(queue_id as usize)
                 .expect("invalid tx queue id");
 
             let mut cur_index = queue.tx_index;
-            let clean_index = clean_tx_queue(&mut queue);
+            let clean_index = clean_tx_queue(queue);
 
             if queue.pool.is_none() {
-                if let Some(packet) = buffer.get(0) {
+                if let Some(packet) = buffer.front() {
                     queue.pool = Some(packet.pool.clone());
                 }
             }
@@ -641,7 +641,7 @@ impl IxgbeVFDevice {
 
             // section 7.1.9 - setup descriptor ring
             let ring_size_bytes =
-                (NUM_RX_QUEUE_ENTRIES) as usize * mem::size_of::<ixgbe_adv_rx_desc>();
+                NUM_RX_QUEUE_ENTRIES * mem::size_of::<ixgbe_adv_rx_desc>();
 
             let dma: Dma<ixgbe_adv_rx_desc> = Dma::allocate(ring_size_bytes, true)?;
 
@@ -670,7 +670,7 @@ impl IxgbeVFDevice {
                 NUM_RX_QUEUE_ENTRIES + NUM_TX_QUEUE_ENTRIES
             };
 
-            let mempool = Mempool::allocate(mempool_size as usize, PKT_BUF_ENTRY_SIZE).unwrap();
+            let mempool = Mempool::allocate(mempool_size, PKT_BUF_ENTRY_SIZE).unwrap();
 
             let rx_queue = IxgbeRxQueue {
                 descriptors: dma.virt,
@@ -700,7 +700,7 @@ impl IxgbeVFDevice {
 
             // section 7.1.9 - setup descriptor ring
             let ring_size_bytes =
-                NUM_TX_QUEUE_ENTRIES as usize * mem::size_of::<ixgbe_adv_tx_desc>();
+                NUM_TX_QUEUE_ENTRIES * mem::size_of::<ixgbe_adv_tx_desc>();
 
             let dma: Dma<ixgbe_adv_tx_desc> = Dma::allocate(ring_size_bytes, true)?;
             unsafe {
@@ -1189,7 +1189,7 @@ fn clean_tx_queue(queue: &mut IxgbeTxQueue) -> usize {
 
         if (status & IXGBE_ADVTXD_STAT_DD) != 0 {
             if let Some(ref p) = queue.pool {
-                if TX_CLEAN_BATCH as usize >= queue.bufs_in_use.len() {
+                if TX_CLEAN_BATCH >= queue.bufs_in_use.len() {
                     p.free_stack
                         .borrow_mut()
                         .extend(queue.bufs_in_use.drain(..))

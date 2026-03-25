@@ -48,7 +48,7 @@ const MAP_HUGE_2MB: i32 = 0x5400_0000; // 21 << 26
 impl<T> Dma<T> {
     /// Allocates dma memory on a huge page.
     pub fn allocate(size: usize, require_contiguous: bool) -> Result<Dma<T>, Box<dyn Error>> {
-        let size = if size % HUGE_PAGE_SIZE != 0 {
+        let size = if !size.is_multiple_of(HUGE_PAGE_SIZE) {
             ((size >> HUGE_PAGE_BITS) + 1) << HUGE_PAGE_BITS
         } else {
             size
@@ -92,7 +92,7 @@ impl<T> Dma<T> {
                 // finally map huge pages at the huge page size aligned 32 bit address
                 unsafe {
                     libc::mmap(
-                        aligned_addr as *mut libc::c_void,
+                        aligned_addr,
                         size,
                         libc::PROT_READ | libc::PROT_WRITE,
                         libc::MAP_SHARED
@@ -148,6 +148,7 @@ impl<T> Dma<T> {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(true)
                 .open(path.clone())
             {
                 Ok(f) => {
@@ -164,7 +165,7 @@ impl<T> Dma<T> {
 
                     if ptr == libc::MAP_FAILED {
                         Err("failed to memory map huge page - huge pages enabled and free?".into())
-                    } else if unsafe { libc::mlock(ptr as *mut libc::c_void, size) } == 0 {
+                    } else if unsafe { libc::mlock(ptr, size) } == 0 {
                         let memory = Dma {
                             virt: ptr as *mut T,
                             phys: virt_to_phys(ptr as usize)?,
@@ -199,7 +200,7 @@ pub struct Packet {
 impl Clone for Packet {
     fn clone(&self) -> Self {
         let mut p = alloc_pkt(&self.pool, self.len).expect("no buffer available");
-        p.clone_from_slice(&self);
+        p.clone_from_slice(self);
 
         p
     }
@@ -354,7 +355,7 @@ impl Mempool {
             x => x,
         };
 
-        if (get_vfio_container() == -1) && HUGE_PAGE_SIZE % entry_size != 0 {
+        if (get_vfio_container() == -1) && !HUGE_PAGE_SIZE.is_multiple_of(entry_size) {
             panic!("entry size must be a divisor of the page size");
         }
 
@@ -458,7 +459,7 @@ pub fn alloc_pkt(pool: &Rc<Mempool>, size: usize) -> Option<Packet> {
 /// Initializes `len` fields of type `T` at `addr` with `value`.
 pub(crate) unsafe fn memset<T: Copy>(addr: *mut T, len: usize, value: T) {
     for i in 0..len {
-        ptr::write_volatile(addr.add(i) as *mut T, value);
+        ptr::write_volatile(addr.add(i), value);
     }
 }
 
@@ -477,7 +478,7 @@ pub(crate) fn virt_to_phys(addr: usize) -> Result<usize, Box<dyn Error>> {
     let mut buffer = [0; mem::size_of::<usize>()];
     file.read_exact(&mut buffer)?;
 
-    let phys = unsafe { mem::transmute::<[u8; mem::size_of::<usize>()], usize>(buffer) };
+    let phys = usize::from_ne_bytes(buffer);
     Ok((phys & 0x007f_ffff_ffff_ffff) * pagesize + addr % pagesize)
 }
 

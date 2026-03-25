@@ -2,7 +2,7 @@
 
 use std::error::Error;
 use std::fs;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::mem;
 use std::os::unix::io::{IntoRawFd, RawFd};
 use std::path::Path;
@@ -113,8 +113,6 @@ pub struct Event {
 
 /// Initializes the IOMMU for a given PCI device. The device must be bound to the VFIO driver.
 pub fn vfio_init(pci_addr: &str) -> Result<RawFd, Box<dyn Error>> {
-    let dfd: RawFd;
-    let group_file: File;
     let gfd: RawFd;
 
     if vfio_is_intel_iommu(pci_addr) {
@@ -171,9 +169,9 @@ pub fn vfio_init(pci_addr: &str) -> Result<RawFd, Box<dyn Error>> {
 
     let mut vfio_gfds = VFIO_GROUP_FILE_DESCRIPTORS.lock().unwrap();
 
-    if !vfio_gfds.contains_key(&group) {
+    if let std::collections::hash_map::Entry::Vacant(e) = vfio_gfds.entry(group) {
         // open the devices' group
-        group_file = OpenOptions::new()
+        let group_file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(format!("/dev/vfio/{}", group))
@@ -203,7 +201,7 @@ pub fn vfio_init(pci_addr: &str) -> Result<RawFd, Box<dyn Error>> {
             .into());
         }
 
-        vfio_gfds.insert(group, gfd);
+        e.insert(gfd);
     } else {
         gfd = *vfio_gfds.get(&group).unwrap();
     }
@@ -220,7 +218,7 @@ pub fn vfio_init(pci_addr: &str) -> Result<RawFd, Box<dyn Error>> {
     }
 
     // Get a file descriptor for the device
-    dfd = unsafe { libc::ioctl(gfd, VFIO_GROUP_GET_DEVICE_FD, pci_addr) };
+    let dfd: RawFd = unsafe { libc::ioctl(gfd, VFIO_GROUP_GET_DEVICE_FD, pci_addr) };
     if dfd == -1 {
         return Err(format!(
             "failed to VFIO_GROUP_GET_DEVICE_FD. Errno: {}",

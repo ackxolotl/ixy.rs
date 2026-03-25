@@ -119,7 +119,7 @@ pub fn read_hex(file: &mut File) -> Result<u64, Box<dyn Error>> {
     file.read_to_string(&mut buffer)?;
 
     Ok(u64::from_str_radix(
-        &buffer.trim().trim_start_matches("0x"),
+        buffer.trim().trim_start_matches("0x"),
         16,
     )?)
 }

@@ -120,8 +120,6 @@ impl InterruptsQueue {
     /// Returns the number of ready file descriptors.
     pub fn vfio_epoll_wait(&self, timeout: i32) -> Result<usize, Box<dyn Error>> {
         let mut events = [Event::default(); 10];
-        let rc: usize;
-
         let status = unsafe {
             libc::epoll_wait(
                 self.vfio_epoll_fd,
@@ -137,7 +135,7 @@ impl InterruptsQueue {
             )
             .into());
         }
-        rc = status as usize;
+        let rc: usize = status as usize;
         if rc > 0 {
             /* epoll_wait has at least one fd ready to read */
             for event in events.iter().take(rc) {
@@ -316,11 +314,7 @@ impl InterruptsQueue {
         }
         self.rx_pkts = 0;
         let average = self.moving_avg.sum / self.moving_avg.measured_rates.len() as u64;
-        if average > INTERRUPT_THRESHOLD || buf_index == buf_size {
-            self.interrupt_enabled = false;
-        } else {
-            self.interrupt_enabled = true;
-        }
+        self.interrupt_enabled = !(average > INTERRUPT_THRESHOLD || buf_index == buf_size);
         self.last_time_checked = Instant::now();
     }
 }
