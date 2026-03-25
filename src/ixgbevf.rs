@@ -289,7 +289,8 @@ impl IxyDevice for IxgbeVFDevice {
                     );
                     ptr::write_volatile(
                         &mut (*queue.descriptors.add(cur_index)).read.olinfo_status as *mut u32,
-                        (packet.len() as u32) << IXGBE_ADVTXD_PAYLEN_SHIFT,
+                        (packet.len() as u32) << IXGBE_ADVTXD_PAYLEN_SHIFT
+                            | IXGBE_ADVTXD_CC, // VF must reference context descriptor
                     );
                 }
 
@@ -436,6 +437,17 @@ impl IxgbeVFDevice {
         // disable all interrupts
         self.disable_interrupts();
 
+        // flush all TX queues and disable RX queues before reset to prevent
+        // stale DMA operations from triggering MDD on X550+
+        for i in 0..(MAX_QUEUES as u32) {
+            self.set_reg32(IXGBE_VFTXDCTL(i), IXGBE_TXDCTL_SWFLSH);
+        }
+        for i in 0..(MAX_QUEUES as u32) {
+            self.set_reg32(IXGBE_VFRXDCTL(i), 0);
+        }
+        self.get_reg32(IXGBE_STATUS); // flush writes
+        thread::sleep(Duration::from_millis(2));
+
         // reset VF
         self.set_reg32(IXGBE_VFCTRL, IXGBE_CTRL_RST);
         self.get_reg32(IXGBE_STATUS);
@@ -460,6 +472,13 @@ impl IxgbeVFDevice {
         );
 
         self.negotiate_api()?;
+
+        // try to enable promiscuous mode for easier debugging; soft-fail if PF refuses
+        match self.set_promisc(true) {
+            Ok(true) => info!("VF promiscuous mode enabled"),
+            Ok(false) => info!("VF promiscuous mode not available (use `ip link set <pf> vf <id> trust on`)"),
+            Err(e) => warn!("failed to request promiscuous mode: {}", e),
+        }
 
         self.init_tx()?;
 
@@ -546,26 +565,36 @@ impl IxgbeVFDevice {
         let mut msg_buf = [3; IXGBE_VF_PERMADDR_MSG_LEN as usize];
         self.wait_read_msg_from_mbx(&mut msg_buf)?;
 
+        // strip CTS bit — PF may set it in the response
+        msg_buf[0] &= !IXGBE_VT_MSGTYPE_CTS;
+
         if msg_buf[0] != (IXGBE_VF_RESET | IXGBE_VT_MSGTYPE_ACK)
             && msg_buf[0] != (IXGBE_VF_RESET | IXGBE_VT_MSGTYPE_NACK)
         {
-            return Err("invalid mac address".into());
+            return Err(format!("unexpected VF_RESET response: {:#x}", msg_buf[0]).into());
         }
 
         if msg_buf[0] == (IXGBE_VF_RESET | IXGBE_VT_MSGTYPE_ACK) {
             let mut mac = self.mac.borrow_mut();
 
-            mac[0] = (msg_buf[1] >> 24) as u8;
-            mac[1] = (msg_buf[1] >> 16 & 0xff) as u8;
-            mac[2] = (msg_buf[1] >> 8 & 0xff) as u8;
-            mac[3] = (msg_buf[1] & 0xff) as u8;
-            mac[4] = (msg_buf[2] >> 8 & 0xff) as u8;
-            mac[5] = (msg_buf[2] & 0xff) as u8;
+            mac[0] = (msg_buf[1] & 0xff) as u8;
+            mac[1] = (msg_buf[1] >> 8 & 0xff) as u8;
+            mac[2] = (msg_buf[1] >> 16 & 0xff) as u8;
+            mac[3] = (msg_buf[1] >> 24) as u8;
+            mac[4] = (msg_buf[2] & 0xff) as u8;
+            mac[5] = (msg_buf[2] >> 8 & 0xff) as u8;
 
             info!(
                 "received mac address from PF driver: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
             );
+
+            // Register MAC with PF's anti-spoof filter (RAR entry).
+            // The PF assigned us this MAC during VF_RESET, but we must send
+            // SET_MAC_ADDR back to ensure the PF's RAR is properly configured.
+            let mac_copy = *mac;
+            drop(mac);
+            self.set_mac_addr(mac_copy);
         } else {
             let mut mac = self.mac.borrow_mut();
 
@@ -590,9 +619,17 @@ impl IxgbeVFDevice {
     // sections 4.6.7
     /// Initializes the rx queues of this device.
     fn init_rx(&mut self) -> Result<(), Box<dyn Error>> {
+        // The PF disables VF packet receipt after VF_RESET and only re-enables
+        // it when the VF sends SET_LPE (set max packet length). DPDK always
+        // sends this, even without jumbo frames, as a workaround.
+        // Use standard Ethernet frame size (1518) + CRC.
+        let mut msg = [IXGBE_VF_SET_LPE, 1522, 0];
+        self.wait_write_read_msg_mbx(&mut msg)?;
+
         // configure queues, same for all queues
         for i in 0..self.num_rx_queues {
             debug!("initializing rx queue {}", i);
+
             // enable advanced rx descriptors
             self.set_reg32(
                 IXGBE_VFSRRCTL(u32::from(i)),
@@ -660,13 +697,14 @@ impl IxgbeVFDevice {
         // configure queues
         for i in 0..self.num_tx_queues {
             debug!("initializing tx queue {}", i);
+
             // section 7.1.9 - setup descriptor ring
             let ring_size_bytes =
                 NUM_TX_QUEUE_ENTRIES as usize * mem::size_of::<ixgbe_adv_tx_desc>();
 
             let dma: Dma<ixgbe_adv_tx_desc> = Dma::allocate(ring_size_bytes, true)?;
             unsafe {
-                memset(dma.virt as *mut u8, ring_size_bytes, 0xff);
+                memset(dma.virt as *mut u8, ring_size_bytes, 0x00);
             }
 
             self.set_reg32(
@@ -675,6 +713,12 @@ impl IxgbeVFDevice {
             );
             self.set_reg32(IXGBE_VFTDBAH(u32::from(i)), (dma.phys as u64 >> 32) as u32);
             self.set_reg32(IXGBE_VFTDLEN(u32::from(i)), ring_size_bytes as u32);
+
+            // disable Tx head writeback relaxed ordering, since this hoses
+            // bookkeeping if things aren't delivered in order (cf. DPDK ixgbevf_dev_tx_init)
+            let mut txctrl = self.get_reg32(IXGBE_VFDCA_TXCTRL(u32::from(i)));
+            txctrl &= !IXGBE_DCA_TXCTRL_DESC_WRO_EN;
+            self.set_reg32(IXGBE_VFDCA_TXCTRL(u32::from(i)), txctrl);
 
             debug!("tx ring {} phys addr: {:#x}", i, dma.phys);
             debug!("tx ring {} virt addr: {:p}", i, dma.virt);
@@ -761,27 +805,77 @@ impl IxgbeVFDevice {
     fn start_tx_queue(&mut self, queue_id: u16) -> Result<(), Box<dyn Error>> {
         debug!("starting tx queue {}", queue_id);
 
-        let queue = &mut self.tx_queues[queue_id as usize];
-
-        if queue.num_descriptors & (queue.num_descriptors - 1) != 0 {
-            return Err("number of queue entries must be a power of 2".into());
+        {
+            let queue = &self.tx_queues[queue_id as usize];
+            if queue.num_descriptors & (queue.num_descriptors - 1) != 0 {
+                return Err("number of queue entries must be a power of 2".into());
+            }
         }
 
         // tx queue starts out empty
         self.set_reg32(IXGBE_VFTDH(u32::from(queue_id)), 0);
         self.set_reg32(IXGBE_VFTDT(u32::from(queue_id)), 0);
 
+        // VF requires a context descriptor before any data descriptors (DPDK does
+        // the same in ixgbe_write_default_ctx_desc). Without this the PF flags
+        // every TX as a Malicious Driver Detection event.
+        {
+            let queue = &mut self.tx_queues[queue_id as usize];
+            unsafe {
+                let ctx = queue.descriptors.add(0) as *mut ixgbe_adv_tx_context_desc;
+                ptr::write_volatile(
+                    &mut (*ctx).vlan_macip_lens as *mut u32,
+                    14 << IXGBE_ADVTXD_MACLEN_SHIFT, // Ethernet header length
+                );
+                ptr::write_volatile(&mut (*ctx).seqnum_seed as *mut u32, 0);
+                ptr::write_volatile(
+                    &mut (*ctx).type_tucmd_mlhl as *mut u32,
+                    IXGBE_ADVTXD_TUCMD_L4T_RSV
+                        | IXGBE_ADVTXD_DTYP_CTXT
+                        | IXGBE_ADVTXD_DCMD_DEXT,
+                );
+                ptr::write_volatile(&mut (*ctx).mss_l4len_idx as *mut u32, 0);
+            }
+            // advance past the context descriptor
+            queue.tx_index = 1;
+        }
+
         // enable queue and wait if necessary
         self.set_flags32(IXGBE_VFTXDCTL(u32::from(queue_id)), IXGBE_TXDCTL_ENABLE);
         self.wait_set_reg32(IXGBE_VFTXDCTL(u32::from(queue_id)), IXGBE_TXDCTL_ENABLE);
 
+        // tell hardware about the context descriptor
+        self.set_reg32(IXGBE_VFTDT(u32::from(queue_id)), 1);
+
         Ok(())
     }
 
-    /// Enables or disables promiscuous mode of this device.
-    #[allow(dead_code)]
-    fn set_promisc(&self, _enabled: bool) {
-        unimplemented!("PF driver do not support promiscuous mode for VFs yet, see chapter 7.1 in the Intel 82599 SR-IOV driver companion guide");
+    /// Tries to enable or disable promiscuous mode via the PF mailbox.
+    /// Requires API >= 1.2 and a trusted VF (`ip link set <pf> vf <id> trust on`).
+    /// Returns Ok(true) if the mode was set, Ok(false) if the PF refused (e.g. VF not trusted).
+    fn set_promisc(&self, enabled: bool) -> Result<bool, Box<dyn Error>> {
+        let api = self.mbx.borrow().api_version;
+        if (api as u32) < (ixgbe_pfvf_api_rev::ixgbe_mbox_api_12 as u32) {
+            warn!("promiscuous mode requires mailbox API >= 1.2, have {:?}", api);
+            return Ok(false);
+        }
+
+        let mode = if enabled {
+            ixgbevf_xcast_modes::IXGBEVF_XCAST_MODE_PROMISC
+        } else {
+            ixgbevf_xcast_modes::IXGBEVF_XCAST_MODE_NONE
+        };
+
+        let mut msg = [IXGBE_VF_UPDATE_XCAST_MODE, mode as u32, 0];
+        self.wait_write_read_msg_mbx(&mut msg)?;
+
+        msg[0] &= !IXGBE_VT_MSGTYPE_CTS;
+        if msg[0] == (IXGBE_VF_UPDATE_XCAST_MODE | IXGBE_VT_MSGTYPE_NACK) {
+            warn!("PF refused promiscuous mode (VF not trusted or PF not in promisc?)");
+            return Ok(false);
+        }
+
+        Ok(true)
     }
 
     /// Returns the register at `self.addr` + `reg`.
