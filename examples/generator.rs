@@ -24,10 +24,12 @@ pub fn main() {
     let pci_addr = match args.next() {
         Some(arg) => arg,
         None => {
-            eprintln!("Usage: cargo run --example generator <pci bus id>");
+            eprintln!("Usage: cargo run --example generator <pci bus id> [dst_mac]");
             process::exit(1);
         }
     };
+
+    let dst_mac = args.next();
 
     let mut dev = ixy_init(&pci_addr, 1, 1, 0).unwrap();
 
@@ -53,6 +55,21 @@ pub fn main() {
 
     // VFs: src MAC must be MAC of the device (spoof check of PF)
     pkt_data[6..12].clone_from_slice(&dev.get_mac_addr());
+
+    if let Some(ref mac_str) = dst_mac {
+        let bytes: Vec<u8> = mac_str
+            .split(':')
+            .map(|s| u8::from_str_radix(s, 16).unwrap_or_else(|_| {
+                eprintln!("Invalid MAC address: {}", mac_str);
+                process::exit(1);
+            }))
+            .collect();
+        if bytes.len() != 6 {
+            eprintln!("Invalid MAC address: {}", mac_str);
+            process::exit(1);
+        }
+        pkt_data[0..6].clone_from_slice(&bytes);
+    }
 
     let pool = Mempool::allocate(NUM_PACKETS, 0).unwrap();
 

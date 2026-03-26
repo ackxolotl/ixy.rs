@@ -625,6 +625,10 @@ impl IxgbeVFDevice {
         // Use standard Ethernet frame size (1518) + CRC.
         let mut msg = [IXGBE_VF_SET_LPE, 1522, 0];
         self.wait_write_read_msg_mbx(&mut msg)?;
+        msg[0] &= !IXGBE_VT_MSGTYPE_CTS;
+        if msg[0] == (IXGBE_VF_SET_LPE | IXGBE_VT_MSGTYPE_NACK) {
+            warn!("PF refused SET_LPE (VF receive may not be enabled)");
+        }
 
         // configure queues, same for all queues
         for i in 0..self.num_rx_queues {
